@@ -176,8 +176,4 @@ def scan_market_summary(tickers, atr_mult):
     return summary
 
 @st.cache_data(ttl=300)
-def get_advanced_pc_ratio(ticker, current_price):
-    try:
-        tk = yf.Ticker(ticker)
-        expirations = tk.options
-        if not expirations: return None, "無期權數據"
+def
