@@ -141,7 +141,7 @@ def scan_market_summary(tickers, atr_mult):
     summary = {"BUY": [], "HOLD": [], "SELL": []}
     
     try:
-        # 批次下載，使用 group_by='ticker' 方便後續處理
+        # 批次下載
         data = yf.download(tickers, period="3mo", group_by='ticker', progress=False, threads=True, auto_adjust=True)
         
         for ticker in tickers:
@@ -156,7 +156,7 @@ def scan_market_summary(tickers, atr_mult):
                 
                 if df_t.empty: continue
 
-                # 計算訊號 (使用相同的邏輯)
+                # 計算訊號
                 df_t, err = calculate_technical_indicators(df_t, atr_mult)
                 
                 if err: continue
@@ -176,4 +176,194 @@ def scan_market_summary(tickers, atr_mult):
     return summary
 
 @st.cache_data(ttl=300)
-def
+def get_advanced_pc_ratio(ticker, current_price):
+    try:
+        tk = yf.Ticker(ticker)
+        expirations = tk.options
+        
+        # 【修正重點】這裡的縮排已經修正
+        if not expirations: return None, "無期權數據"
+
+        today = datetime.date.today()
+        valid_dates = []
+        for date_str in expirations:
+            try:
+                exp_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+                if 0 <= (exp_date - today).days <= 40: valid_dates.append(date_str)
+            except: continue
+
+        if not valid_dates: return None, "無 40 日內到期合約"
+
+        total_call_vol = 0; total_put_vol = 0; details = []
+
+        for date in valid_dates:
+            try:
+                opt = tk.option_chain(date)
+                calls, puts = opt.calls, opt.puts
+                if calls is None or puts is None or calls.empty or puts.empty: continue
+
+                center_idx_c = (np.abs(calls['strike'] - current_price)).argmin()
+                c_vol = calls.iloc[max(0,center_idx_c-5):min(len(calls),center_idx_c+6)]['volume'].fillna(0).sum()
+                
+                center_idx_p = (np.abs(puts['strike'] - current_price)).argmin()
+                p_vol = puts.iloc[max(0,center_idx_p-5):min(len(puts),center_idx_p+6)]['volume'].fillna(0).sum()
+
+                total_call_vol += c_vol; total_put_vol += p_vol
+                details.append({"到期日": date, "Call": int(c_vol), "Put": int(p_vol)})
+            except: continue
+        
+        ratio = total_put_vol / total_call_vol if total_call_vol > 0 else 2.0
+        return {"ratio": ratio, "total_call": total_call_vol, "total_put": total_put_vol, "details": details}, None
+    
+    # 這裡的 except 正確對齊了 try
+    except Exception as e: return None, str(e)
+
+
+# --- 5. 介面佈局 ---
+st.title("AlphaTrader 量化終端 (台股版)")
+
+# 時間與存檔檢查 (調整為台北時間)
+tpe = pytz.timezone('Asia/Taipei')
+now_tpe = datetime.datetime.now(tpe)
+
+# 台股交易時間：平日 09:00 - 13:30
+is_market_open = (now_tpe.weekday() < 5) and (9 <= now_tpe.hour < 13) or (now_tpe.hour == 13 and now_tpe.minute <= 30)
+# 收盤前 5 分鐘窗口 (13:25 - 13:30)
+is_closing_window = (now_tpe.hour == 13 and now_tpe.minute >= 25 and now_tpe.minute <= 30)
+
+with st.container():
+    st.markdown('<div class="control-panel">', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1.5, 1.5, 1])
+    with c1:
+        # 預設選擇 2330.TW (台積電)
+        default_idx = TARGET_TICKERS.index('2330.TW') if '2330.TW' in TARGET_TICKERS else 0
+        selected_ticker = st.selectbox("台股標的", TARGET_TICKERS, index=default_idx)
+    with c2:
+        atr_multiplier = st.slider("ATR 止損乘數", 1.5, 4.0, 2.5, 0.1)
+    with c3:
+        st.markdown("<br>", unsafe_allow_html=True)
+        auto_refresh = st.checkbox("每分刷新", value=True)
+        if st.button("🔄 刷新"): st.rerun()
+        
+    time_str = now_tpe.strftime('%H:%M TPE')
+    if is_closing_window: st.caption(f"⚡ 台股收盤前時段 ({time_str}) - 系統將自動存檔")
+    elif not is_market_open: st.caption(f"🌑 非交易時段 ({time_str}) - 載入參考資料中...")
+    else: st.caption(f"🟢 盤中即時 ({time_str})")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# === A. 單一股票詳細分析 ===
+df, error = get_signal(selected_ticker, atr_multiplier)
+
+if error:
+    st.error(f"錯誤: {error}")
+else:
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    signal = last['Signal']
+    
+    # 期權與存檔邏輯 (台股期權資料可能較少，若無資料顯示 N/A 為正常)
+    pc_data, pc_error = get_advanced_pc_ratio(selected_ticker, last['Close'])
+    data_source_badge = ""
+    
+    if is_closing_window and pc_data:
+        saved = load_snapshot(selected_ticker)
+        if not saved or saved.get('date') != now_tpe.strftime('%Y-%m-%d'):
+            save_snapshot(selected_ticker, last['Close'], pc_data)
+            st.toast(f"✅ {selected_ticker} 已自動存檔", icon="💾")
+
+    if not pc_data: 
+        snap = load_snapshot(selected_ticker)
+        if snap:
+            pc_data = snap['pc_data']
+            data_source_badge = f'<span class="snapshot-badge">📁 歷史快照 ({snap.get("date")})</span>'
+
+    # 頂部狀態
+    if signal == 'BUY': st.success(f"🔥 {selected_ticker} 強力買進 (STRONG BUY)")
+    elif signal == 'SELL': st.error(f"🛑 {selected_ticker} 離場/止損 (SELL/EXIT)")
+    else: st.info(f"👀 {selected_ticker} 觀望/持有 (HOLD)")
+
+    # KPI
+    k1, k2, k3, k4 = st.columns(4)
+    with k1: st.metric("最新價格", f"${last['Close']:.2f}", f"{(last['Close']-prev['Close']):.2f}")
+    with k2: st.metric("建議止損", f"${last['Stop_Loss']:.2f}")
+    with k3: st.metric("風險/股", f"${(last['Close']-last['Stop_Loss']):.2f}")
+    with k4:
+        if pc_data:
+            r = pc_data['ratio']
+            lbl = "看多" if r < 0.7 else "看空" if r > 1.0 else "中性"
+            st.metric("P/C Ratio", f"{r:.2f}", lbl, delta_color="inverse")
+            if data_source_badge: st.markdown(data_source_badge, unsafe_allow_html=True)
+        else: st.metric("P/C Ratio", "N/A", "無數據")
+
+    st.markdown("---")
+
+    # 圖表
+    main_col, side_col = st.columns([2, 1])
+    with main_col:
+        st.subheader("📈 技術走勢")
+        st.line_chart(df[['Close', 'EMA_8', 'EMA_21']].tail(60), color=["#000000", "#00ff00", "#ff0000"])
+    with side_col:
+        st.subheader("📊 籌碼分析")
+        if pc_data:
+            tot = pc_data['total_call'] + pc_data['total_put']
+            c_p = (pc_data['total_call']/tot)*100 if tot>0 else 0
+            p_p = (pc_data['total_put']/tot)*100 if tot>0 else 0
+            st.caption("40日內，現價上下5檔")
+            st.progress(int(c_p), text=f"Call: {int(pc_data['total_call']):,}")
+            st.progress(int(p_p), text=f"Put: {int(pc_data['total_put']):,}")
+            st.dataframe(pd.DataFrame(pc_data['details']).head(3), hide_index=True, use_container_width=True)
+        else: st.warning("無資料 (台股期權數據可能不完整)")
+
+    # --- 歷史表格 (修復 ValueError 問題) ---
+    with st.expander("查看技術數據"):
+        cols_to_show = ['Close', 'Volume', 'EMA_8', 'EMA_21', 'MACD_Hist', 'Signal', 'Stop_Loss']
+        
+        # 關鍵修正：只對數字欄位使用 .2f 格式，避開 Signal
+        format_dict = {
+            'Close': '{:.2f}', 'Volume': '{:.0f}', 'EMA_8': '{:.2f}',
+            'EMA_21': '{:.2f}', 'MACD_Hist': '{:.2f}', 'Stop_Loss': '{:.2f}'
+        }
+        st.dataframe(df[cols_to_show].tail(5).style.format(format_dict))
+
+# === B. 全市場訊號彙整總表 ===
+st.markdown("---")
+st.subheader("🌍 全市場戰情總表 (Market Summary)")
+
+with st.spinner("正在掃描市場訊號..."):
+    market_signals = scan_market_summary(TARGET_TICKERS, atr_multiplier)
+
+if market_signals:
+    max_len = max(len(market_signals["BUY"]), len(market_signals["HOLD"]), len(market_signals["SELL"]))
+    
+    buy_list = market_signals["BUY"] + [""] * (max_len - len(market_signals["BUY"]))
+    hold_list = market_signals["HOLD"] + [""] * (max_len - len(market_signals["HOLD"]))
+    sell_list = market_signals["SELL"] + [""] * (max_len - len(market_signals["SELL"]))
+    
+    summary_df = pd.DataFrame({
+        "BUY (強力買進)": buy_list,
+        "HOLD (觀望持有)": hold_list,
+        "SELL (離場止損)": sell_list
+    })
+    
+    st.dataframe(
+        summary_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "BUY (強力買進)": st.column_config.TextColumn(help="動能強勁，符合所有買進條件"),
+            "SELL (離場止損)": st.column_config.TextColumn(help="趨勢破壞，建議離場"),
+            "HOLD (觀望持有)": st.column_config.TextColumn(help="盤整中或趨勢不明顯")
+        }
+    )
+else:
+    st.error("無法取得市場總覽數據")
+
+# 自動刷新
+if auto_refresh:
+    placeholder = st.empty()
+    for s in range(60, 0, -1):
+        now_str = datetime.datetime.now(tpe).strftime('%H:%M:%S')
+        placeholder.markdown(f'<div class="countdown-box">🕒 {now_str} | ⏳ {s}s 刷新</div>', unsafe_allow_html=True)
+        time.sleep(1)
+    placeholder.empty()
+    st.rerun()
