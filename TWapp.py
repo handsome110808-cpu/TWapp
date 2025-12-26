@@ -13,8 +13,8 @@ from plotly.subplots import make_subplots
 
 # --- 1. 網頁設定 ---
 st.set_page_config(
-    page_title="AlphaTrader - TW 量化交易終端",
-    page_icon="📈",
+    page_title="AlphaTrader - AI 量化交易終端",
+    page_icon="🦅",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -28,21 +28,20 @@ st.markdown("""
     .countdown-box { position: fixed; bottom: 10px; right: 10px; background-color: #ffffff; border: 1px solid #ddd; padding: 5px 10px; border-radius: 5px; font-size: 12px; color: #666; z-index: 999; }
     .snapshot-badge { background-color: #e3f2fd; color: #1565c0; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; border: 1px solid #bbdefb; }
     
-    /* 總表樣式優化 */
-    .summary-header { font-size: 20px; font-weight: bold; margin-bottom: 10px; text-align: center; }
+    /* 資金流向樣式 */
+    .flow-in { color: #00c853; font-weight: bold; }
+    .flow-out { color: #d50000; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 3. 全域設定與快照功能 ---
-SNAPSHOT_FILE = 'options_history.json'
+# --- 3. 全域設定與股票清單 ---
+SNAPSHOT_FILE = 'market_flow_history.json'
 
-# 指定的目標股票清單 (台股代碼需加上 .TW)
+# 您指定的美股+ADR清單
 TARGET_TICKERS = sorted([
-    "0050.TW",  # 元大台灣50
-    "0056.TW",  # 元大高股息
-    "00737.TW", # 國泰AI+Robo
-    "2317.TW",  # 鴻海
-    "2330.TW"   # 台積電
+    "AAPL", "AMD", "APP", "ASML", "AVGO", "GOOG", "HIMS", "INTC",
+    "LLY", "LRCX", "MSFT", "MU", "NBIS", "NVDA", "ORCL", "PLTR",
+    "QQQ", "SPY", "XLV", "TEM", "TSLA", "TSM"
 ])
 
 def load_snapshot(ticker):
@@ -53,12 +52,12 @@ def load_snapshot(ticker):
         return data.get(ticker)
     except: return None
 
-def save_snapshot(ticker, price, pc_data):
+def save_snapshot(ticker, price, flow_data):
     record = {
         "date": datetime.datetime.now().strftime('%Y-%m-%d'),
         "timestamp": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         "close_price": price,
-        "pc_data": pc_data
+        "flow_data": flow_data
     }
     all_data = {}
     if os.path.exists(SNAPSHOT_FILE):
@@ -69,175 +68,125 @@ def save_snapshot(ticker, price, pc_data):
     with open(SNAPSHOT_FILE, 'w') as f: json.dump(all_data, f, indent=4)
     return True
 
-# --- 4. 核心運算邏輯 (提取共用) ---
+# --- 4. 核心運算邏輯 (資金流向版) ---
 def calculate_technical_indicators(df, atr_mult):
     """共用的技術指標與訊號計算邏輯"""
-    # 確保數據足夠
     if len(df) < 50: return df, "數據不足"
-    
-    # 填補空值
     df = df.ffill()
 
-    # 計算指標
+    # 1. 均線與趨勢
     df['EMA_8'] = ta.ema(df['Close'], length=8)
     df['EMA_21'] = ta.ema(df['Close'], length=21)
     
+    # 2. MACD
     macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
     if macd is not None:
         df = pd.concat([df, macd], axis=1)
-        # 重新命名欄位，避免後續抓不到
-        cols_map = {
-            df.columns[-3]: 'MACD_Line', 
-            df.columns[-2]: 'MACD_Hist', 
-            df.columns[-1]: 'MACD_Signal'
-        }
+        cols_map = {df.columns[-3]: 'MACD_Line', df.columns[-2]: 'MACD_Hist', df.columns[-1]: 'MACD_Signal'}
         df.rename(columns=cols_map, inplace=True)
 
+    # 3. 資金流向指標 (Institutional Flow Proxies)
+    # CMF (Chaikin Money Flow): 判斷主力吸籌(>0)或派發(<0)
+    df['CMF'] = ta.cmf(df['High'], df['Low'], df['Close'], df['Volume'], length=20)
+    # MFI (Money Flow Index): 資金動能 (類似RSI但含成交量)
+    df['MFI'] = ta.mfi(df['High'], df['Low'], df['Close'], df['Volume'], length=14)
+
+    # 4. 波動率與止損
     df['Vol_SMA_10'] = ta.sma(df['Volume'], length=10)
     df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
     df['Stop_Loss'] = df['Close'] - (df['ATR'] * atr_mult)
 
-    # 訊號判定邏輯
-    # 1. 買進條件
+    # --- 訊號判定邏輯 ---
+    # 買進：趨勢向上 + 動能增強 + 資金流入 (CMF > -0.05, 允許輕微背離但不能大出貨)
     conditions = [
         (df['Close'] > df['EMA_8']) & 
         (df['EMA_8'] > df['EMA_21']) & 
         (df['MACD_Hist'] > 0) & 
         (df['MACD_Hist'] > df['MACD_Hist'].shift(1)) & 
-        (df['Volume'] > df['Vol_SMA_10'] * 1.2)
+        (df['CMF'] > -0.05) # 資金面確認：主力沒有明顯出貨
     ]
     df['Signal'] = np.select(conditions, ['BUY'], default='HOLD')
     
-    # 2. 賣出條件 (優先權高於 HOLD)
-    sell_cond = (df['Close'] < df['EMA_21']) | (df['MACD_Hist'] < 0)
+    # 賣出：跌破均線 或 資金大幅流出 (CMF < -0.15)
+    sell_cond = (df['Close'] < df['EMA_21']) | (df['MACD_Hist'] < 0) | (df['CMF'] < -0.2)
     df.loc[sell_cond, 'Signal'] = 'SELL'
     
     return df, None
 
 @st.cache_data(ttl=60)
-def get_signal(ticker, atr_mult):
+def get_analysis_data(ticker, atr_mult):
     """單一股票詳細分析"""
     try:
-        # 下載數據，台股建議使用 auto_adjust=True 處理除權息
-        df = yf.download(ticker, period="6mo", progress=False, auto_adjust=True)
+        df = yf.download(ticker, period="6mo", progress=False)
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         
-        # 處理非交易時段的空數據
         if len(df) > 0:
             last_row = df.iloc[-1]
-            if pd.isna(last_row['Close']) or pd.isna(last_row['Open']): df = df.iloc[:-1]
+            if pd.isna(last_row['Close']): df = df.iloc[:-1]
 
-        # 呼叫共用邏輯
         df, err = calculate_technical_indicators(df, atr_mult)
-        if err: return None, err
+        if err: return None, err, None
         
-        return df, None
+        # 提取資金流向數據
+        last = df.iloc[-1]
+        flow_data = {
+            "CMF": last['CMF'], # 資金流向
+            "MFI": last['MFI'], # 資金動能
+            "Vol_Ratio": last['Volume'] / last['Vol_SMA_10'] if last['Vol_SMA_10'] > 0 else 1.0
+        }
+        
+        return df, None, flow_data
     except Exception as e:
-        return None, str(e)
+        return None, str(e), None
 
 @st.cache_data(ttl=60)
 def scan_market_summary(tickers, atr_mult):
-    """批次掃描全市場訊號 (總表用)"""
+    """批次掃描全市場訊號 (含資金流向)"""
     summary = {"BUY": [], "HOLD": [], "SELL": []}
     
     try:
-        # 批次下載
-        data = yf.download(tickers, period="3mo", group_by='ticker', progress=False, threads=True, auto_adjust=True)
+        data = yf.download(tickers, period="3mo", group_by='ticker', progress=False, threads=True)
         
         for ticker in tickers:
             try:
-                # 處理 MultiIndex 資料結構
                 df_t = data[ticker].copy()
-                
-                # 簡單清洗
                 if len(df_t) > 0:
-                    last_row = df_t.iloc[-1]
-                    if pd.isna(last_row['Close']): df_t = df_t.iloc[:-1]
-                
+                    if pd.isna(df_t.iloc[-1]['Close']): df_t = df_t.iloc[:-1]
                 if df_t.empty: continue
 
-                # 計算訊號
                 df_t, err = calculate_technical_indicators(df_t, atr_mult)
-                
                 if err: continue
                 
-                last_sig = df_t.iloc[-1]['Signal']
+                last = df_t.iloc[-1]
                 
-                # 分類
-                if last_sig == "BUY": summary["BUY"].append(ticker)
-                elif last_sig == "SELL": summary["SELL"].append(ticker)
-                else: summary["HOLD"].append(ticker)
-            except:
-                continue
+                # 簡單標註資金狀態
+                flow_status = " (資金入)" if last['CMF'] > 0.05 else " (資金出)" if last['CMF'] < -0.05 else ""
+                ticker_display = f"{ticker}{flow_status}"
                 
-    except Exception as e:
-        return None
-        
+                if last['Signal'] == "BUY": summary["BUY"].append(ticker_display)
+                elif last['Signal'] == "SELL": summary["SELL"].append(ticker_display)
+                else: summary["HOLD"].append(ticker_display)
+            except: continue
+                
+    except Exception as e: return None
     return summary
 
-@st.cache_data(ttl=300)
-def get_advanced_pc_ratio(ticker, current_price):
-    try:
-        tk = yf.Ticker(ticker)
-        expirations = tk.options
-        
-        # 【修正重點】這裡的縮排已經修正
-        if not expirations: return None, "無期權數據"
-
-        today = datetime.date.today()
-        valid_dates = []
-        for date_str in expirations:
-            try:
-                exp_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
-                if 0 <= (exp_date - today).days <= 40: valid_dates.append(date_str)
-            except: continue
-
-        if not valid_dates: return None, "無 40 日內到期合約"
-
-        total_call_vol = 0; total_put_vol = 0; details = []
-
-        for date in valid_dates:
-            try:
-                opt = tk.option_chain(date)
-                calls, puts = opt.calls, opt.puts
-                if calls is None or puts is None or calls.empty or puts.empty: continue
-
-                center_idx_c = (np.abs(calls['strike'] - current_price)).argmin()
-                c_vol = calls.iloc[max(0,center_idx_c-5):min(len(calls),center_idx_c+6)]['volume'].fillna(0).sum()
-                
-                center_idx_p = (np.abs(puts['strike'] - current_price)).argmin()
-                p_vol = puts.iloc[max(0,center_idx_p-5):min(len(puts),center_idx_p+6)]['volume'].fillna(0).sum()
-
-                total_call_vol += c_vol; total_put_vol += p_vol
-                details.append({"到期日": date, "Call": int(c_vol), "Put": int(p_vol)})
-            except: continue
-        
-        ratio = total_put_vol / total_call_vol if total_call_vol > 0 else 2.0
-        return {"ratio": ratio, "total_call": total_call_vol, "total_put": total_put_vol, "details": details}, None
-    
-    # 這裡的 except 正確對齊了 try
-    except Exception as e: return None, str(e)
-
-
 # --- 5. 介面佈局 ---
-st.title("AlphaTrader 量化終端 (台股版)")
+st.title("AlphaTrader 量化終端 (資金流向版)")
 
-# 時間與存檔檢查 (調整為台北時間)
-tpe = pytz.timezone('Asia/Taipei')
-now_tpe = datetime.datetime.now(tpe)
-
-# 台股交易時間：平日 09:00 - 13:30
-is_market_open = (now_tpe.weekday() < 5) and (9 <= now_tpe.hour < 13) or (now_tpe.hour == 13 and now_tpe.minute <= 30)
-# 收盤前 5 分鐘窗口 (13:25 - 13:30)
-is_closing_window = (now_tpe.hour == 13 and now_tpe.minute >= 25 and now_tpe.minute <= 30)
+# 時間設定 (美股使用美東時間)
+est = pytz.timezone('US/Eastern')
+now_est = datetime.datetime.now(est)
+is_market_open = (now_est.weekday() < 5) and (9 <= now_est.hour < 16) or (now_est.hour == 16 and now_est.minute == 0)
+is_closing_window = (now_est.hour == 15 and now_est.minute >= 55)
 
 with st.container():
     st.markdown('<div class="control-panel">', unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1.5, 1.5, 1])
     with c1:
-        # 預設選擇 2330.TW (台積電)
-        default_idx = TARGET_TICKERS.index('2330.TW') if '2330.TW' in TARGET_TICKERS else 0
-        selected_ticker = st.selectbox("台股標的", TARGET_TICKERS, index=default_idx)
+        # 預設選擇 NVDA
+        default_idx = TARGET_TICKERS.index('NVDA') if 'NVDA' in TARGET_TICKERS else 0
+        selected_ticker = st.selectbox("美股標的", TARGET_TICKERS, index=default_idx)
     with c2:
         atr_multiplier = st.slider("ATR 止損乘數", 1.5, 4.0, 2.5, 0.1)
     with c3:
@@ -245,14 +194,13 @@ with st.container():
         auto_refresh = st.checkbox("每分刷新", value=True)
         if st.button("🔄 刷新"): st.rerun()
         
-    time_str = now_tpe.strftime('%H:%M TPE')
-    if is_closing_window: st.caption(f"⚡ 台股收盤前時段 ({time_str}) - 系統將自動存檔")
-    elif not is_market_open: st.caption(f"🌑 非交易時段 ({time_str}) - 載入參考資料中...")
-    else: st.caption(f"🟢 盤中即時 ({time_str})")
+    time_str = now_est.strftime('%H:%M EST')
+    status_text = "⚡ 收盤存檔中" if is_closing_window else "🟢 盤中交易" if is_market_open else "🌑 休市中"
+    st.caption(f"{status_text} ({time_str})")
     st.markdown('</div>', unsafe_allow_html=True)
 
 # === A. 單一股票詳細分析 ===
-df, error = get_signal(selected_ticker, atr_multiplier)
+df, error, flow_data = get_analysis_data(selected_ticker, atr_multiplier)
 
 if error:
     st.error(f"錯誤: {error}")
@@ -261,88 +209,97 @@ else:
     prev = df.iloc[-2]
     signal = last['Signal']
     
-    # 期權與存檔邏輯 (台股期權資料可能較少，若無資料顯示 N/A 為正常)
-    pc_data, pc_error = get_advanced_pc_ratio(selected_ticker, last['Close'])
-    data_source_badge = ""
-    
-    if is_closing_window and pc_data:
+    # 自動存檔邏輯
+    if is_closing_window and flow_data:
         saved = load_snapshot(selected_ticker)
-        if not saved or saved.get('date') != now_tpe.strftime('%Y-%m-%d'):
-            save_snapshot(selected_ticker, last['Close'], pc_data)
-            st.toast(f"✅ {selected_ticker} 已自動存檔", icon="💾")
-
-    if not pc_data: 
-        snap = load_snapshot(selected_ticker)
-        if snap:
-            pc_data = snap['pc_data']
-            data_source_badge = f'<span class="snapshot-badge">📁 歷史快照 ({snap.get("date")})</span>'
+        if not saved or saved.get('date') != now_est.strftime('%Y-%m-%d'):
+            save_snapshot(selected_ticker, last['Close'], flow_data)
+            st.toast(f"✅ {selected_ticker} 資金流向數據已存檔", icon="💾")
 
     # 頂部狀態
     if signal == 'BUY': st.success(f"🔥 {selected_ticker} 強力買進 (STRONG BUY)")
     elif signal == 'SELL': st.error(f"🛑 {selected_ticker} 離場/止損 (SELL/EXIT)")
     else: st.info(f"👀 {selected_ticker} 觀望/持有 (HOLD)")
 
-    # KPI
+    # 資金流向解讀
+    cmf_val = flow_data['CMF']
+    if cmf_val > 0.1: flow_status = "主力大舉買進"
+    elif cmf_val > 0: flow_status = "資金溫和流入"
+    elif cmf_val > -0.1: flow_status = "資金震盪/觀望"
+    else: flow_status = "主力正在出貨"
+    
+    flow_color = "inverse" if cmf_val > 0 else "normal" # 綠色流入，紅色流出
+
+    # KPI 卡片
     k1, k2, k3, k4 = st.columns(4)
     with k1: st.metric("最新價格", f"${last['Close']:.2f}", f"{(last['Close']-prev['Close']):.2f}")
     with k2: st.metric("建議止損", f"${last['Stop_Loss']:.2f}")
-    with k3: st.metric("風險/股", f"${(last['Close']-last['Stop_Loss']):.2f}")
-    with k4:
-        if pc_data:
-            r = pc_data['ratio']
-            lbl = "看多" if r < 0.7 else "看空" if r > 1.0 else "中性"
-            st.metric("P/C Ratio", f"{r:.2f}", lbl, delta_color="inverse")
-            if data_source_badge: st.markdown(data_source_badge, unsafe_allow_html=True)
-        else: st.metric("P/C Ratio", "N/A", "無數據")
+    with k3: st.metric("單股風險", f"${(last['Close']-last['Stop_Loss']):.2f}")
+    with k4: st.metric("主力資金流 (CMF)", f"{cmf_val:.3f}", flow_status, delta_color="off" if cmf_val < 0 else "inverse")
 
     st.markdown("---")
 
-    # 圖表
+    # 圖表區 (左圖右數據)
     main_col, side_col = st.columns([2, 1])
     with main_col:
-        st.subheader("📈 技術走勢")
-        st.line_chart(df[['Close', 'EMA_8', 'EMA_21']].tail(60), color=["#000000", "#00ff00", "#ff0000"])
-    with side_col:
-        st.subheader("📊 籌碼分析")
-        if pc_data:
-            tot = pc_data['total_call'] + pc_data['total_put']
-            c_p = (pc_data['total_call']/tot)*100 if tot>0 else 0
-            p_p = (pc_data['total_put']/tot)*100 if tot>0 else 0
-            st.caption("40日內，現價上下5檔")
-            st.progress(int(c_p), text=f"Call: {int(pc_data['total_call']):,}")
-            st.progress(int(p_p), text=f"Put: {int(pc_data['total_put']):,}")
-            st.dataframe(pd.DataFrame(pc_data['details']).head(3), hide_index=True, use_container_width=True)
-        else: st.warning("無資料 (台股期權數據可能不完整)")
+        st.subheader("📈 價量與趨勢")
+        # 繪製價格與均線
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_8'], line=dict(color='yellow', width=1), name='EMA 8'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_21'], line=dict(color='purple', width=1), name='EMA 21'), row=1, col=1)
+        # CMF 資金指標
+        colors = ['#00c853' if v >= 0 else '#d50000' for v in df['CMF']]
+        fig.add_trace(go.Bar(x=df.index, y=df['CMF'], marker_color=colors, name='資金流 (CMF)'), row=2, col=1)
+        fig.update_layout(height=500, xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=0, b=0))
+        st.plotly_chart(fig, use_container_width=True)
 
-    # --- 歷史表格 (修復 ValueError 問題) ---
-    with st.expander("查看技術數據"):
-        cols_to_show = ['Close', 'Volume', 'EMA_8', 'EMA_21', 'MACD_Hist', 'Signal', 'Stop_Loss']
+    with side_col:
+        st.subheader("📊 機構籌碼分析")
         
-        # 關鍵修正：只對數字欄位使用 .2f 格式，避開 Signal
-        format_dict = {
-            'Close': '{:.2f}', 'Volume': '{:.0f}', 'EMA_8': '{:.2f}',
-            'EMA_21': '{:.2f}', 'MACD_Hist': '{:.2f}', 'Stop_Loss': '{:.2f}'
-        }
-        st.dataframe(df[cols_to_show].tail(5).style.format(format_dict))
+        # 1. CMF 資金流向 (核心判斷)
+        st.write("**1. 資金淨流量 (CMF)**")
+        cmf_pct = (cmf_val + 0.5) # 正規化顯示
+        st.progress(min(max(cmf_pct, 0.0), 1.0), text=f"數值: {cmf_val:.3f} ({flow_status})")
+        
+        # 2. MFI 資金動能
+        st.write("**2. 資金動能 (MFI)**")
+        mfi_val = flow_data['MFI']
+        st.progress(int(mfi_val), text=f"MFI: {mfi_val:.1f} ( >80 過熱, <20 超賣 )")
+        
+        # 3. 量能分析
+        st.write("**3. 成交量能比**")
+        vol_r = flow_data['Vol_Ratio']
+        if vol_r > 1.5: st.warning(f"🔥 爆量攻擊 ({vol_r:.1f}x)")
+        elif vol_r < 0.7: st.info(f"❄️ 量縮整理 ({vol_r:.1f}x)")
+        else: st.write(f"⚖️ 量能溫和 ({vol_r:.1f}x)")
+        
+        st.markdown("---")
+        st.info("💡 **解讀：** \nCMF > 0 代表機構吸籌(多頭)，CMF < 0 代表機構派發(空頭)。結合 MFI 判斷是否資金過熱。")
+
+    # 歷史數據表格
+    with st.expander("查看詳細數據"):
+        cols = ['Close', 'Volume', 'EMA_8', 'CMF', 'MFI', 'Signal']
+        fmt = {'Close':'{:.2f}', 'Volume':'{:.0f}', 'EMA_8':'{:.2f}', 'CMF':'{:.3f}', 'MFI':'{:.1f}'}
+        st.dataframe(df[cols].tail(5).style.format(fmt))
 
 # === B. 全市場訊號彙整總表 ===
 st.markdown("---")
-st.subheader("🌍 全市場戰情總表 (Market Summary)")
+st.subheader("🌍 全市場資金流向總表 (Institutional Flow)")
 
 with st.spinner("正在掃描市場訊號..."):
     market_signals = scan_market_summary(TARGET_TICKERS, atr_multiplier)
 
 if market_signals:
     max_len = max(len(market_signals["BUY"]), len(market_signals["HOLD"]), len(market_signals["SELL"]))
-    
     buy_list = market_signals["BUY"] + [""] * (max_len - len(market_signals["BUY"]))
     hold_list = market_signals["HOLD"] + [""] * (max_len - len(market_signals["HOLD"]))
     sell_list = market_signals["SELL"] + [""] * (max_len - len(market_signals["SELL"]))
     
     summary_df = pd.DataFrame({
-        "BUY (強力買進)": buy_list,
-        "HOLD (觀望持有)": hold_list,
-        "SELL (離場止損)": sell_list
+        "BUY (資金流入)": buy_list,
+        "HOLD (觀望/震盪)": hold_list,
+        "SELL (資金流出)": sell_list
     })
     
     st.dataframe(
@@ -350,19 +307,18 @@ if market_signals:
         use_container_width=True,
         hide_index=True,
         column_config={
-            "BUY (強力買進)": st.column_config.TextColumn(help="動能強勁，符合所有買進條件"),
-            "SELL (離場止損)": st.column_config.TextColumn(help="趨勢破壞，建議離場"),
-            "HOLD (觀望持有)": st.column_config.TextColumn(help="盤整中或趨勢不明顯")
+            "BUY (資金流入)": st.column_config.TextColumn(help="技術面強勢 + 資金淨流入"),
+            "SELL (資金流出)": st.column_config.TextColumn(help="技術面轉弱 + 資金淨流出"),
+            "HOLD (觀望/震盪)": st.column_config.TextColumn(help="多空不明或資金無明顯方向")
         }
     )
 else:
-    st.error("無法取得市場總覽數據")
+    st.error("無法取得市場數據")
 
-# 自動刷新
 if auto_refresh:
     placeholder = st.empty()
     for s in range(60, 0, -1):
-        now_str = datetime.datetime.now(tpe).strftime('%H:%M:%S')
+        now_str = datetime.datetime.now(est).strftime('%H:%M:%S')
         placeholder.markdown(f'<div class="countdown-box">🕒 {now_str} | ⏳ {s}s 刷新</div>', unsafe_allow_html=True)
         time.sleep(1)
     placeholder.empty()
